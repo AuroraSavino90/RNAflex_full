@@ -1,0 +1,7 @@
+/data
+/results
+/discarded_scripts
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
