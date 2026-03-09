@@ -311,11 +311,11 @@ message("=== 04D completato ===")
 # Guarda prima la distribuzione per scegliere una soglia informata
 quantile(THAL$cluster_pct_TH_norm, probs = c(0.1, 0.25, 0.5, 0.75, 0.9), na.rm = TRUE)
 
-TH_SOGLIA <- 25  # <<< modifica dopo aver visto la distribuzione
+TH_SOGLIA <- 0   # cellule TH_low = cluster con pct_TH_norm == 0 (nessun origine talamica nell'atlas)
 
 THAL$TH_group <- case_when(
   is.na(THAL$cluster_pct_TH_norm)          ~ "no_mapping",
-  THAL$cluster_pct_TH_norm >= TH_SOGLIA     ~ "TH_high",
+  THAL$cluster_pct_TH_norm > TH_SOGLIA     ~ "TH_high",
   TRUE                                       ~ "TH_low"
 )
 
@@ -446,6 +446,50 @@ write.csv(low_roi_agg,
 
 message("=== 04E completato ===")
 
+# ==============================================================================
+# FILTRO TH — tieni TH_high + cellule no_mapping (NA in cluster_pct_TH_norm)
+# ==============================================================================
+# TH_high  = pct_TH_norm >= TH_SOGLIA  → cellule talamiche vere
+# no_mapping = cluster_pct_TH_norm è NA → oligodendrociti, astrociti ecc.
+#              che MapMyCells non ha potuto classificare; vengono tenuti
+#              perché la loro esclusione è basata sull'assenza di dati,
+#              non su evidenza di contaminazione.
+# TH_low   = pct_TH_norm < TH_SOGLIA  → escluse, analizzate in ST_05
+# ==============================================================================
+
+# Salva THAL completo (con TH_low) prima del filtro — serve per 04F
+THAL_all_cells <- THAL
+
+n_before  <- ncol(THAL)
+keep_mask <- is.na(THAL$cluster_pct_TH_norm) |
+             THAL$cluster_pct_TH_norm >= TH_SOGLIA
+
+THAL_filt <- THAL[, keep_mask]
+n_after   <- ncol(THAL_filt)
+
+message(sprintf(
+  "Filtro TH: %d -> %d cellule (rimossi %d TH_low, %.1f%%)",
+  n_before, n_after, n_before - n_after,
+  100 * (n_before - n_after) / n_before
+))
+
+cat("\nCellule per campione dopo filtro:\n")
+print(table(THAL_filt$orig.ident))
+
+cat("\nCellule per TH_group nel dataset filtrato:\n")
+print(table(THAL_filt$TH_group, useNA = "always"))
+
+cat("\nCellule per TH_group rimosse:\n")
+print(table(THAL$TH_group[!keep_mask]))
+
+THAL <- THAL_filt
+rm(THAL_filt)
+
+# Salva conteggio cellule TH_low per ROI PRIMA del filtro
+# (serve per 04F scatter — dopo il filtro le cellule TH_low non esistono più in THAL)
+low_cells_per_roi_counts <- table(THAL_all_cells$mmc_cluster_alias[
+  !is.na(THAL_all_cells$TH_group) & THAL_all_cells$TH_group == "TH_low"
+])
 
 
 # ==============================================================================
@@ -622,12 +666,13 @@ print(final_table, n = 30)
 
 
 # Aggiungi n_cells_THAL_in_low_clusters alla final_table
+# Usa low_cells_per_roi_counts salvato prima del filtro TH_high
 low_cells_per_roi <- cluster_roi_norm %>%
   filter(cluster_alias %in% low_aliases) %>%
   left_join(
     data.frame(
-      cluster_alias   = as.integer(names(table(THAL$mmc_cluster_alias[THAL$TH_group == "TH_low"]))),
-      n_cells_in_THAL = as.integer(table(THAL$mmc_cluster_alias[THAL$TH_group == "TH_low"]))
+      cluster_alias   = as.integer(names(low_cells_per_roi_counts)),
+      n_cells_in_THAL = as.integer(low_cells_per_roi_counts)
     ),
     by = "cluster_alias"
   ) %>%
@@ -888,236 +933,98 @@ if ("mmc_subclass" %in% colnames(THAL@meta.data)) {
           width = 4000, height = 3000)
 }
 
-# --- 04B.4 — Annotazione anatomica broad da meta_df ------------------------
-# broad_anat = macroarea CCF (parte prima di ":" in CCF_broad.freq)
-# fine_anat  = annotazione anatomica fine-grained (anatomical_annotation)
+# --- 04B.4 — Distribuzione cellule per campione (diagnostica) ---------------
+cat(sprintf("\n  Cellule per campione — %s:\n", obj_nm))
+print(table(THAL$orig.ident))
 
-fine_anat  <- meta_df$anatomical_annotation
-broad_anat <- sub("\\:.*", "", meta_df$CCF_broad.freq)
+# --- 04B.5 — UMAP contaminanti stimati da cluster_top_roi --------------------
+# Colorazione basata sulla ROI di origine del cluster (pct_norm):
+# TH = grigio (cellule talamiche attese), tutto il resto = colori distinti
 
-anat_lookup <- data.frame(
-  cluster_id = meta_df$cluster_id_label,
-  broad_anat = broad_anat,
-  fine_anat  = fine_anat,
-  stringsAsFactors = FALSE
-)
+if ("cluster_top_roi" %in% colnames(THAL@meta.data)) {
 
-idx          <- match(THAL$mmc_cluster, anat_lookup$cluster_id)
-THAL$broad_anat <- anat_lookup$broad_anat[idx]
-THAL$fine_anat  <- anat_lookup$fine_anat[idx]
+  roi_levels_all <- sort(unique(na.omit(THAL$cluster_top_roi)))
+  non_TH_rois    <- roi_levels_all[roi_levels_all != "TH"]
 
-n_mapped <- sum(!is.na(THAL$broad_anat))
-message(sprintf("  %s: broad_anat assegnato a %d/%d cellule",
-                obj_nm, n_mapped, ncol(obj)))
+  cat(sprintf("\nROI di origine nei cluster (pct_norm): %s\n",
+              paste(roi_levels_all, collapse = ", ")))
+  cat(sprintf("Cellule con top_roi == TH: %d (%.1f%%)\n",
+              sum(THAL$cluster_top_roi == "TH", na.rm = TRUE),
+              100 * mean(THAL$cluster_top_roi == "TH", na.rm = TRUE)))
+  cat(sprintf("Cellule con top_roi != TH: %d (%.1f%%)\n",
+              sum(THAL$cluster_top_roi != "TH", na.rm = TRUE),
+              100 * mean(THAL$cluster_top_roi != "TH", na.rm = TRUE)))
 
-cat("\n=== Macroaree CCF presenti (broad_anat) ===\n")
-cat("THAL: "); cat(sort(unique(THAL$broad_anat)), sep = ", "); cat("\n")
-
-# --- 04B.5 — Analisi contaminazione anatomica --------------------------------
-# Classi attese per il talamo:
-#   "Thalamus"    = nuclei talamici relay e associativi
-#   "Epithalamus" = habenula (MH, LH), spesso co-dissezionata
-#
-# <<< Modificare le liste se le etichette nel tuo dataset differiscono >>>
-# (le etichette esatte compaiono nel printout qui sopra)
-THALAMUS_CLASSES <- c(
-  "TH"
-)
-CONTAM_THRESHOLD <- 0.05   # soglia accettabile (5%)
-
-if ("broad_anat" %in% colnames(THAL@meta.data)) {
-
-  expected_classes <- THALAMUS_CLASSES
-  area_label       <- "Thalamus"
-
-  meta <- THAL@meta.data
-  meta$broad_anat_clean <- ifelse(is.na(meta$broad_anat), "unmapped",
-                                  meta$broad_anat)
-
-  class_tab <- as.data.frame(table(meta$broad_anat_clean)) %>%
-    rename(broad_anat = Var1, n_cells = Freq) %>%
-    mutate(
-      pct         = round(100 * n_cells / sum(n_cells), 2),
-      is_expected = broad_anat %in% expected_classes
-    ) %>%
-    arrange(desc(n_cells))
-
-  cat(sprintf("\n=== Proporzione macroaree CCF (broad_anat) — %s ===\n", obj_nm))
-  print(class_tab)
-
-  n_expected    <- sum(class_tab$n_cells[ class_tab$is_expected])
-  n_contaminant <- sum(class_tab$n_cells[!class_tab$is_expected])
-  pct_expected  <- round(100 * n_expected    / nrow(meta), 2)
-  pct_contam    <- round(100 * n_contaminant / nrow(meta), 2)
-
-  cat(sprintf(
-    "\n  Attese (%s): %d (%.2f%%)\n  Contaminanti: %d (%.2f%%)\n",
-    paste(expected_classes, collapse = " / "),
-    n_expected, pct_expected, n_contaminant, pct_contam
-  ))
-
-  # Test chi-quadro: proporzione contaminanti omogenea tra campioni?
-  meta$is_contaminant <- !(meta$broad_anat_clean %in% expected_classes)
-  cont_tab <- table(meta$orig.ident, meta$is_contaminant)
-
-  if (ncol(cont_tab) == 2) {
-    colnames(cont_tab) <- c("expected", "contaminant")
-
-    cont_df <- as.data.frame(cont_tab) %>%
-      rename(sample = Var1, status = Var2, n = Freq) %>%
-      group_by(sample) %>%
-      mutate(pct = round(100 * n / sum(n), 2)) %>%
-      ungroup() %>%
-      filter(status == "contaminant") %>%
-      select(sample, n, pct) %>%
-      arrange(desc(pct))
-
-    cat(sprintf("\n--- Contaminanti per campione — %s ---\n", obj_nm))
-    print(cont_df)
-
-    if (nrow(cont_tab) > 1 && all(cont_tab > 0)) {
-      chi_res <- chisq.test(cont_tab)
-      cat(sprintf(
-        "\n  Chi-quadro tra campioni: X2=%.2f, df=%d, p=%.4f\n",
-        chi_res$statistic, chi_res$parameter, chi_res$p.value
-      ))
-      if (chi_res$p.value < 0.05)
-        cat("  *** Proporzione contaminanti significativamente diversa tra campioni\n")
-      else
-        cat("  Proporzione contaminanti omogenea tra campioni (p >= 0.05)\n")
-    }
-  } else {
-    cont_df <- data.frame(sample = rownames(cont_tab), n = 0, pct = 0)
-    cat(sprintf("\n  Nessun contaminante trovato in %s\n", obj_nm))
-  }
-
-  # Plot 1: barplot proporzioni macroaree broad_anat
-  class_plot <- class_tab %>%
-    mutate(
-      label = ifelse(pct < 1 & !is_expected, "altre (<1%)", as.character(broad_anat)),
-      fill  = case_when(
-        is_expected             ~ "#2980B9",
-        label == "altre (<1%)" ~ "grey70",
-        label == "unmapped"    ~ "grey40",
-        TRUE                   ~ "#E74C3C"
-      )
-    ) %>%
-    group_by(label, fill) %>%
-    summarise(n_cells = sum(n_cells), .groups = "drop") %>%
-    mutate(pct = round(100 * n_cells / sum(n_cells), 2)) %>%
-    arrange(desc(n_cells))
-
-  fill_pal <- setNames(class_plot$fill, class_plot$label)
-
-  p_bar_anat <- ggplot(class_plot,
-                       aes(x = reorder(label, n_cells), y = pct, fill = label)) +
-    geom_bar(stat = "identity") +
-    geom_text(aes(label = sprintf("%.1f%%", pct)), hjust = -0.1, size = 3) +
-    coord_flip() +
-    scale_fill_manual(values = fill_pal, guide = "none") +
-    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
-    theme_bw(base_size = 10) +
-    labs(
-      title    = paste("Macroaree CCF (broad_anat) —", obj_nm),
-      subtitle = sprintf("Blu = atteso (%s) | Rosso = contaminante | n=%d cellule",
-                         area_label, nrow(meta)),
-      x = "", y = "% cellule"
-    )
-  savepng(p_bar_anat, paste0("04_anatomy_barplot_", obj_nm, ".png"),
-          width = 3500, height = max(2000, nrow(class_plot) * 120 + 700))
-
-  # Plot 2: UMAP con contaminanti evidenziati
-  THAL$contam_label <- ifelse(
-    meta$broad_anat_clean %in% expected_classes, "Atteso",
-    ifelse(meta$broad_anat_clean == "unmapped", "Non mappato",
-           meta$broad_anat_clean)
-  )
-
-  contam_classes <- setdiff(sort(unique(THAL$contam_label)),
-                            c("Atteso", "Non mappato"))
-  n_contam <- length(contam_classes)
-
+  # Palette: TH in grigio chiaro, non-TH con colori distinti
   base_cols <- unique(c(
     RColorBrewer::brewer.pal(9,  "Set1"),
     RColorBrewer::brewer.pal(8,  "Dark2"),
     RColorBrewer::brewer.pal(12, "Paired")
   ))
-  if (n_contam > length(base_cols)) base_cols <- colorRampPalette(base_cols)(n_contam)
+  if (length(non_TH_rois) > length(base_cols))
+    base_cols <- colorRampPalette(base_cols)(length(non_TH_rois))
 
-  pal_contam <- c(
-    "Atteso"      = "grey85",
-    "Non mappato" = "grey50",
-    setNames(base_cols[seq_len(n_contam)], contam_classes)
+  pal_roi_contam <- c(
+    "TH" = "grey85",
+    setNames(base_cols[seq_len(length(non_TH_rois))], non_TH_rois)
+  )
+  if (any(is.na(THAL$cluster_top_roi)))
+    pal_roi_contam["NA"] <- "grey50"
+
+  p_umap_roi_contam <- DimPlot(
+    THAL,
+    group.by = "cluster_top_roi",
+    cols     = pal_roi_contam,
+    pt.size  = 0.3,
+    order    = c("TH", non_TH_rois)   # TH sotto, non-TH sopra
+  ) +
+    ggtitle(paste("ROI di origine cluster (pct_norm) —", obj_nm)) +
+    labs(colour = "Top ROI") +
+    theme_classic(base_size = 12) +
+    guides(colour = guide_legend(override.aes = list(size = 3), ncol = 2))
+
+  savepng(p_umap_roi_contam,
+          paste0("04B5_UMAP_roi_origin_", obj_nm, ".png"),
+          width = 4500, height = 3500)
+
+  # Barplot: % cellule per ROI di origine
+  roi_tab <- as.data.frame(table(THAL$cluster_top_roi, useNA = "always")) %>%
+    rename(roi = Var1, n_cells = Freq) %>%
+    mutate(
+      pct    = round(100 * n_cells / sum(n_cells), 2),
+      is_TH  = roi == "TH",
+      roi    = as.character(roi)
+    ) %>%
+    arrange(desc(n_cells))
+
+  fill_pal_bar <- setNames(
+    ifelse(roi_tab$is_TH, "grey85",
+           ifelse(is.na(roi_tab$roi), "grey50", "#E74C3C")),
+    roi_tab$roi
   )
 
-  p_umap_contam <- DimPlot(
-    THAL, group.by = "contam_label", pt.size = 0.3,
-    cols  = pal_contam,
-    order = c("Atteso", "Non mappato", contam_classes)
-  ) +
-    ggtitle(paste("Contaminanti anatomici (broad_anat) —", obj_nm)) +
-    theme(legend.text = element_text(size = 8))
-  savepng(p_umap_contam, paste0("04_UMAP_contamination_", obj_nm, ".png"),
-          width = 4000, height = 3500)
+  p_bar_roi <- ggplot(roi_tab,
+                      aes(x = reorder(roi, n_cells), y = pct, fill = roi)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.1f%%", pct)), hjust = -0.1, size = 3) +
+    coord_flip() +
+    scale_fill_manual(values = fill_pal_bar, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    theme_bw(base_size = 10) +
+    labs(
+      title    = paste("ROI di origine cluster (pct_norm) —", obj_nm),
+      subtitle = "Grigio = TH (atteso) | Rosso = altra ROI",
+      x = "", y = "% cellule"
+    )
+  savepng(p_bar_roi, paste0("04B5_barplot_roi_origin_", obj_nm, ".png"),
+          width = 3500, height = max(2000, nrow(roi_tab) * 120 + 700))
 
-  # Plot 3: UMAP con fine_anat
-  fine_freq  <- table(THAL$fine_anat)
-  fine_keep  <- names(fine_freq[fine_freq >= 10])
-  THAL$fine_anat_plot <- ifelse(THAL$fine_anat %in% fine_keep,
-                                THAL$fine_anat, "altre (<10 cellule)")
-  THAL$fine_anat_plot[is.na(THAL$fine_anat_plot)] <- "unmapped"
-
-  fine_levels <- sort(unique(THAL$fine_anat_plot))
-  fine_real   <- setdiff(fine_levels, c("altre (<10 cellule)", "unmapped"))
-  pal_fine    <- setNames(
-    c(scales::hue_pal()(length(fine_real)), "grey70", "grey40"),
-    c(fine_real, "altre (<10 cellule)", "unmapped")
-  )
-
-  p_umap_fine <- DimPlot(
-    THAL, group.by = "fine_anat_plot", pt.size = 0.2, label = FALSE,
-    cols  = pal_fine,
-    order = c(fine_real, "altre (<10 cellule)", "unmapped")
-  ) +
-    ggtitle(paste("Annotazione anatomica fine (fine_anat) —", obj_nm)) +
-    theme(legend.text = element_text(size = 7), legend.key.size = unit(0.35, "cm"))
-  savepng(p_umap_fine, paste0("04_UMAP_fine_anat_", obj_nm, ".png"),
-          width = 6000, height = 3500)
-
-  # Salva tabelle diagnostiche
-  write.csv(class_tab,
-            file.path(outdir, paste0("04_anatomy_proportions_", obj_nm, ".csv")),
+  write.csv(roi_tab,
+            file.path(outdir, paste0("04B5_roi_origin_proportions_", obj_nm, ".csv")),
             row.names = FALSE)
-  write.csv(cont_df,
-            file.path(outdir, paste0("04_contamination_by_sample_", obj_nm, ".csv")),
-            row.names = FALSE)
-
-  # --- 04B.6 — Filtraggio: tieni solo cellule talamiche ----------------------
-  # Rimuove contaminanti corticali, striatali, ecc.
-  # KEEP_UNMAPPED = TRUE per approccio conservativo
-  KEEP_UNMAPPED <- FALSE
-
-  n_before    <- ncol(THAL)
-  is_expected <- THAL$broad_anat %in% expected_classes
-  is_unmapped <- is.na(THAL$broad_anat)
-  keep_mask   <- if (KEEP_UNMAPPED) is_expected | is_unmapped else is_expected
-
-  obj_filt  <- THAL[, keep_mask]
-  n_after   <- ncol(obj_filt)
-  n_removed <- n_before - n_after
-
-  message(sprintf(
-    "  %s: %d -> %d cellule (rimossi %d contaminanti, %.1f%%)",
-    obj_nm, n_before, n_after, n_removed, 100 * n_removed / n_before
-  ))
-
-  cat(sprintf("\n  Cellule per campione dopo filtraggio — %s:\n", obj_nm))
-  print(table(obj_filt$orig.ident))
-
-  THAL <- obj_filt
 }
 
-# --- Salvataggio post-04B ----------------------------------------------------
+# --- Salvataggio post-04B (prima del filtro TH) ------------------------------
 save(THAL, file = file.path(outdir, "THAL_annotated.RData"))
 message("Salvato: THAL_annotated.RData")
 
@@ -1125,91 +1032,41 @@ message("Salvato: THAL_annotated.RData")
 # ==============================================================================
 # PARTE C — ASSEGNAZIONE ROI TALAMICA DA MAPMYCELLS CLUSTER
 # ==============================================================================
-# Flusso: mmc_cluster (MapMyCells) -> cluster_alias (cell_metadata) -> ROI
-#
-# Le ROI talamiche nel cell_metadata ABCA sono sotto label WMB-10X-Thalamus.
-# Verificare i label esatti con: unique(meta_full$feature_matrix_label)
+# Riusa cluster_roi_norm già calcolata nella prima parte (coerenza con TH_high/low).
+# La ROI assegnata è quella con pct_norm massima (normalizzata per dimensione ROI
+# nell'atlas), non la ROI con più cellule in assoluto.
 # ==============================================================================
 
 message("=== 04C. Assegnazione ROI talamica da cluster MapMyCells ===")
 
-CELL_META_CSV <- "data/cell_metadata.csv"
-
-# --- 1. Carica cell_metadata e filtra talamo ---------------------------------
-meta_full <- read.csv(CELL_META_CSV, row.names = 1)
-
-cat("\nLabel feature_matrix disponibili nel cell_metadata:\n")
-print(table(meta_full$feature_matrix_label))
-
-# <<< Verificare e aggiornare i label esatti >>>
-meta_thal <- meta_full[
-  meta_full$feature_matrix_label %in%
-    c("WMB-10Xv2-TH", "WMB-10Xv3-TH"), ]
-
-cat("\nCellule talamo in cell_metadata:", nrow(meta_thal), "\n")
-cat("Colonne disponibili:", colnames(meta_thal), "\n")
-
-# --- 2. Costruisci mapping cluster_alias -> ROI ------------------------------
-cluster_roi_map <- meta_thal %>%
-  filter(!is.na(region_of_interest_acronym), !is.na(cluster_alias)) %>%
-  group_by(cluster_alias, region_of_interest_acronym) %>%
-  summarise(n = n(), .groups = "drop") %>%
+# --- 1. Mapping cluster_alias -> top_roi (per pct_norm) ----------------------
+# Riusa cluster_roi_norm dalla prima parte — stesso criterio di TH_high/TH_low
+cluster_roi_map <- cluster_roi_norm %>%
   group_by(cluster_alias) %>%
-  mutate(
-    total        = sum(n),
-    pct          = round(100 * n / total, 1),
-    roi_majority = region_of_interest_acronym[which.max(n)]
-  ) %>%
-  slice_max(n, n = 1, with_ties = FALSE) %>%
-  select(cluster_alias, roi_majority, pct_majority = pct, n_cells_in_roi = n) %>%
+  slice_max(pct_norm, n = 1, with_ties = FALSE) %>%
+  select(cluster_alias,
+         roi_majority    = region_of_interest_acronym,
+         pct_majority    = pct_norm,       # normalizzata
+         pct_majority_raw = pct_raw,       # grezza per confronto
+         n_cells_in_roi  = n_cells) %>%
   ungroup()
 
-cat("\nMapping cluster_alias -> ROI talamica (prime 20 righe):\n")
+cat("\nMapping cluster_alias -> ROI (top pct_norm):\n")
 print(head(cluster_roi_map, 20))
-cat("...\n")
 cat("Cluster totali con ROI assegnata:", nrow(cluster_roi_map), "\n")
 
-cat("\nPurezza del mapping (% cellule nella ROI maggioritaria):\n")
+cat("\nPurezza del mapping (pct_norm nella ROI maggioritaria):\n")
 print(summary(cluster_roi_map$pct_majority))
-cat("Cluster con purezza >80%:", sum(cluster_roi_map$pct_majority > 80), "\n")
-cat("Cluster con purezza >50%:", sum(cluster_roi_map$pct_majority > 50), "\n")
+cat("Cluster con pct_norm >50:", sum(cluster_roi_map$pct_majority > 50), "\n")
+cat("Cluster con pct_norm >25:", sum(cluster_roi_map$pct_majority > 25), "\n")
 
-
-# --- 3. Estrai cluster_alias dal nome cluster MapMyCells --------------------
-cat("\nEsempi mmc_cluster nel tuo oggetto:\n")
-print(head(unique(THAL$mmc_cluster), 10))
-cat("\nEsempi cluster_alias in cell_metadata:\n")
-print(head(unique(meta_thal$cluster_alias), 10))
-
-mapping_raw <- read.csv(MAPPING_CSV, comment.char = "#")
-cat("\nColonne nel CSV MapMyCells:\n")
-print(colnames(mapping_raw))
-cat("\nPrime 3 righe:\n")
-print(head(mapping_raw, 3))
-
-
-# --- 4. Join: cluster MapMyCells -> cluster_alias -> ROI --------------------
-if ("cluster_alias" %in% colnames(mapping_raw)) {
-
-  cat("\nUsando colonna cluster_alias diretta dal CSV MapMyCells\n")
-  THAL$mmc_cluster_alias <- mapping_raw$cluster_alias[
-    match(colnames(THAL), mapping_raw$cell_id)
-  ]
-
-} else {
-
-  cat("\nEstraendo cluster_alias dal nome cluster (numero iniziale)\n")
-  THAL$mmc_cluster_alias <- as.character(
-    as.integer(sub("^(\\d+).*", "\\1", THAL$mmc_cluster))
-  )
-}
-
-cat("\nEsempi mmc_cluster_alias estratti:\n")
-print(head(unique(THAL$mmc_cluster_alias), 10))
-
-
-# --- 5. Assegna ROI all'oggetto Seurat --------------------------------------
+# --- 2. Assegna ROI a ogni cellula di THAL -----------------------------------
 THAL$mmc_roi <- cluster_roi_map$roi_majority[
+  match(THAL$mmc_cluster_alias, cluster_roi_map$cluster_alias)
+]
+
+# Purezza: pct_norm della ROI assegnata (coerente con soglia TH_high/low)
+THAL$mmc_roi_purity <- cluster_roi_map$pct_majority[
   match(THAL$mmc_cluster_alias, cluster_roi_map$cluster_alias)
 ]
 
@@ -1223,22 +1080,7 @@ cat(sprintf("Cellule senza ROI:         %d (%.1f%%)\n",
 cat("\nDistribuzione ROI talamiche:\n")
 print(table(THAL$mmc_roi, useNA = "always"))
 
-
-# --- 6. Aggrega ROI -> macro-area talamica ----------------------------------
-# ROI ABCA per il talamo (aggiornare in base al printout sopra).
-# Raggruppamento basato su CCFv3 / Allen Mouse Brain Atlas:
-#
-#   Ventral     = nuclei relay somatosensoriali/motori (VPL, VPM, VM, VAL, ecc.)
-#   Mediodorsal = MD e nuclei intralaminari (CM, PF, CL, PC, ecc.)
-#   Anterior    = gruppo anteriore (AV, AM, AD, LD)
-#   Lateral     = LP, PO, PoT e aree di associazione
-#   Posterior   = pulvinar e complesso posteriore (PIL, SPA, SPF, ecc.)
-#   Geniculate  = corpi genicolati (LGd, LGv, MG)
-#   Midline     = nuclei della linea mediana (RE, RH, Xi, CM)
-#   Epithalamus = habenula mediale e laterale (MH, LH)
-#
-# <<< Aggiornare le liste in base ai label ROI effettivi nel tuo dataset >>>
-
+# --- 3. Aggrega ROI -> macro-area talamica -----------------------------------
 macro_areas <- list(
   Ventral     = c("VENT", "VPL", "VPM", "VPLpc", "VPMpc", "VM", "VAL", "VL"),
   Mediodorsal = c("MED", "MD", "CM", "PF", "CL", "PC", "IMD"),
@@ -1254,17 +1096,15 @@ roi_to_macro <- stack(macro_areas)
 colnames(roi_to_macro) <- c("roi", "macro_area")
 roi_to_macro <- roi_to_macro[!duplicated(roi_to_macro$roi), ]
 
-THAL$mmc_macro_area <- roi_to_macro$macro_area[
+THAL$mmc_macro_area <- as.character(roi_to_macro$macro_area[
   match(THAL$mmc_roi, roi_to_macro$roi)
-]
-THAL$mmc_macro_area <- as.character(THAL$mmc_macro_area)
+])
 THAL$mmc_macro_area[is.na(THAL$mmc_macro_area)] <- "Unassigned"
 
 cat("\nDistribuzione macro-aree talamiche:\n")
 print(table(THAL$mmc_macro_area))
 
-
-# --- 7. Plot diagnostici ----------------------------------------------------
+# --- 4. Plot diagnostici -----------------------------------------------------
 area_colors <- c(
   Ventral     = "#E63946",
   Mediodorsal = "#457B9D",
@@ -1277,57 +1117,48 @@ area_colors <- c(
   Unassigned  = "#CCCCCC"
 )
 
-# UMAP per macro-area talamica
 p_roi <- DimPlot(THAL, group.by = "mmc_macro_area",
                  cols = area_colors, label = TRUE, repel = TRUE,
                  pt.size = 0.3) +
-  ggtitle("Nucleo Talamico (da MapMyCells cluster -> ROI)") +
+  ggtitle("Nucleo Talamico (da MapMyCells cluster -> ROI, pct_norm)") +
   theme_classic(base_size = 12)
 savepng(p_roi, "04C_UMAP_mmc_macro_area_THAL.png", width = 4000, height = 3500)
 
-# UMAP per ROI fine
 roi_levels <- sort(unique(na.omit(THAL$mmc_roi)))
 pal_roi    <- setNames(scales::hue_pal()(length(roi_levels)), roi_levels)
-pal_roi["NA"] <- "grey70"
 
 p_roi_fine <- DimPlot(THAL, group.by = "mmc_roi",
                       cols = pal_roi, label = TRUE, repel = TRUE,
                       pt.size = 0.3, label.size = 2.5) +
-  ggtitle("ROI ABCA talamica (da MapMyCells cluster)") +
+  ggtitle("ROI ABCA talamica (da MapMyCells cluster, pct_norm)") +
   theme_classic(base_size = 12)
 savepng(p_roi_fine, "04C_UMAP_mmc_roi_fine_THAL.png", width = 5000, height = 3500)
 
-# Barplot: composizione ROI per cell_type
 if ("cell_type" %in% colnames(THAL@meta.data)) {
   comp_df <- THAL@meta.data %>%
     filter(!is.na(mmc_roi)) %>%
-    count(cell_type, mmc_roi) %>%
+    dplyr::count(cell_type, mmc_roi) %>%
     group_by(cell_type) %>%
     mutate(pct = n / sum(n) * 100)
 
   p_bar <- ggplot(comp_df, aes(x = cell_type, y = pct, fill = mmc_roi)) +
     geom_bar(stat = "identity", position = "stack") +
-    labs(title = "Composizione ROI talamica per cell type",
+    labs(title = "Composizione ROI talamica per cell type (pct_norm)",
          x = "Cell Type", y = "% cellule", fill = "ROI") +
     theme_classic(base_size = 11) +
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
   savepng(p_bar, "04C_barplot_roi_by_celltype_THAL.png", width = 4000, height = 2500)
 }
 
-# Purezza del mapping per ROI
-THAL$mmc_roi_purity <- cluster_roi_map$pct_majority[
-  match(THAL$mmc_cluster_alias, cluster_roi_map$cluster_alias)
-]
-cat("\nPurezza media del mapping ROI per cellula:",
-    round(mean(THAL$mmc_roi_purity, na.rm = TRUE), 1), "%\n")
+cat("\nPurezza media del mapping ROI per cellula (pct_norm):",
+    round(mean(THAL$mmc_roi_purity, na.rm = TRUE), 1), "\n")
 
-
-# --- 8. Salvataggio ----------------------------------------------------------
+# --- 5. Salvataggio ----------------------------------------------------------
 save(THAL, file = file.path(outdir, "THAL_annotated_MMC_fin.RData"))
 
 write.csv(
   THAL@meta.data %>%
-    select(any_of(c("mmc_class", "mmc_subclass", "mmc_cluster",
+    dplyr::select(any_of(c("mmc_class", "mmc_subclass", "mmc_cluster",
                     "mmc_cluster_alias", "mmc_roi", "mmc_roi_purity",
                     "mmc_macro_area"))),
   file.path(outdir, "04C_roi_assignments_THAL.csv"),
